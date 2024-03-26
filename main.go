@@ -4,6 +4,7 @@ import (
     "encoding/json"
     "fmt"
     "math/rand"
+    "sync"
     "sync/atomic"
     "os"
     "strconv"
@@ -69,15 +70,30 @@ type LogData struct {
     VtapSrc             string  `json:"vtap_src"`
 }
 
+var logDataPool = sync.Pool{
+    New: func() interface{} {
+        return &LogData{}
+    },
+}
+
 func randomIP() string {
     return fmt.Sprintf("%d.%d.%d.%d", rand.Intn(256), rand.Intn(256), rand.Intn(256), rand.Intn(256))
 }
 
+func getKubernetesClientId(prefix string) string {
+    hostname := os.Getenv("HOSTNAME") // HOSTNAME 环境变量通常包含 Pod 名称
+    if hostname == "" {
+        hostname = "unknown"
+    }
+    return fmt.Sprintf("%s-%s", prefix, hostname)
+}
+
 // ProducerConfig 创建 Kafka 生产者的配置
 func ProducerConfig(broker string) *kafka.ConfigMap {
+    clientId := getKubernetesClientId("go-producer")
     return &kafka.ConfigMap{
         "bootstrap.servers": broker,
-        "client.id":         "go-producer",
+        "client.id":         clientId,
         "compression.type":  "snappy",
         "queue.buffering.max.messages": 2000,
         "queue.buffering.max.kbytes": 3000,
@@ -102,18 +118,13 @@ func SendJSONMessage(producer *kafka.Producer, topic string, message string) err
     return producer.Produce(msg, nil)
 }
 
-var (
-    msgIdCounter int64
-)
+var msgIdCounter int64
 
-func generateLogData() LogData {
+func generateLogData() *LogData {
+    logData := logDataPool.Get().(*LogData)
 
-    msgId := atomic.AddInt64(&msgIdCounter, 1);
-
-    // fmt.Printf("Current message id: %s\n", strconv.FormatInt(msgId, 10))
-
-    return LogData{
-        MsgId:               strconv.FormatInt(msgId, 10),
+    *logData = LogData{
+        MsgId:               strconv.FormatInt(atomic.AddInt64(&msgIdCounter, 1), 10),
         AppDst:              "tf-bin-prod-quickwit",
         AppSrc:              "quickwit",
         AutoInstanceDst:     randomIP(),
@@ -169,11 +180,11 @@ func generateLogData() LogData {
         VtapId:              strconv.FormatInt(rand.Int63(), 10),
         VtapSrc:             "ip-192-119-50-221.ap-east-10.compute.internal-V22128",
     }
+
+    return logData
 }
 
 func main() {
-
-
     sendToKafka := os.Getenv("SEND_TO_KAFKA") == "true"
     broker := os.Getenv("KAFKA_BROKER")
     topic := os.Getenv("KAFKA_TOPIC")
@@ -190,6 +201,18 @@ func main() {
         defer producer.Close()
     }
 
+    // Start a Goroutine for Kafka events handling
+    go func() {
+        for e := range producer.Events() {
+            switch ev := e.(type) {
+            case *kafka.Message:
+                if ev.TopicPartition.Error != nil {
+                    fmt.Printf("Delivery failed: %v\n", ev.TopicPartition.Error)
+                }
+            }
+        }
+    }()
+
     numPerSecond := 600
     counter := 0
 
@@ -203,23 +226,33 @@ func main() {
         select {
         case <-generateTicker.C:
             logData := generateLogData()
-            jsonData, err := json.MarshalIndent(logData, "", "  ")
+            jsonData, err := json.Marshal(logData)
             if err != nil {
                 fmt.Println("Error marshalling JSON:", err)
                 continue
             }
 
             if sendToKafka {
-                if err := SendJSONMessage(producer, topic, string(jsonData)); err != nil {
+                err := SendJSONMessage(producer, topic, string(jsonData))
+                if err != nil {
                     fmt.Printf("Failed to send message: %s\n", err)
                 }
             } else {
                 fmt.Println(string(jsonData))
             }
+
+            // Release the logData back to the pool
+            logDataPool.Put(logData)
+
             counter++
         case <-countTicker.C:
             fmt.Printf("Tasks generated this second: %d\n", counter)
             counter = 0
+
+            // Flush the producer to ensure all messages are sent
+            if sendToKafka {
+                producer.Flush(10)
+            }
         }
     }
 }
