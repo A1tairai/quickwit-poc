@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: quickwit-poc-deployment
+spec:
+  replicas: 500
+  selector:
+    matchLabels:
+      app: quickwit-poc
+  template:
+    metadata:
+      labels:
+        app: quickwit-poc
+    spec:
+      containers:
+      - name: quickwit-poc
+        image: 767398036361.dkr.ecr.ap-northeast-1.amazonaws.com/quickwit-poc:latest
+        env:
+        - name: KAFKA_BROKER
+          value: "b-8.quickwitmsk.8otisf.c4.kafka.ap-northeast-1.amazonaws.com:9092,b-9.quickwitmsk.8otisf.c4.kafka.ap-northeast-1.amazonaws.com:9092,b-5.quickwitmsk.8otisf.c4.kafka.ap-northeast-1.amazonaws.com:9092"
+        - name: KAFKA_TOPIC
+          value: "quickwig_topic"
+        - name: SEND_TO_KAFKA
+          value: "true"
+        # Add other environment variables or container configuration as needed
